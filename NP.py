@@ -57,21 +57,26 @@ def load_and_preprocess(
     )
 
 
-def make_np_batch(X, Y, batch_size, min_ctx=3, max_ctx=None):
+def make_np_batch(X, Y, num_ctx, min_ctx=3, max_ctx=None):
     N = X.size(0)
-    if batch_size > N:
-        raise ValueError("batch_size bigger than dataset")
+    if num_ctx > N:
+        raise ValueError("num_ctx bigger than dataset")
 
-    idx = torch.randperm(N, device=X.device)[:batch_size]   # 不放回
-    x_b, y_b = X[idx], Y[idx]
+    idx = torch.randperm(N)[:num_ctx]
+    x_b, y_b = X[idx], Y[idx]  # batch = context + target
 
-    max_ctx = max_ctx or (batch_size - 1)
-    n_ctx = torch.randint(min_ctx, max_ctx + 1, (1,), device=X.device).item()
+    max_ctx = max_ctx or (num_ctx - 1)
+    n_ctx = torch.randint(min_ctx, max_ctx + 1, (1,)).item()
+    c_idx = torch.randperm(num_ctx)[:n_ctx]
 
-    ctx_idx = torch.randperm(batch_size, device=X.device)[:n_ctx]
-    x_ctx, y_ctx = x_b[ctx_idx], y_b[ctx_idx]               # 上下文
+    mask = torch.ones(num_ctx, dtype=torch.bool)
+    mask[c_idx] = False
+    t_idx = torch.where(mask)[0]
 
-    return x_ctx, y_ctx, x_b, y_b, n_ctx, batch_size        # 目标 = 全部
+    x_ctx, y_ctx = x_b[c_idx],   y_b[c_idx]       # (N_ctx,  x_dim), (N_ctx,  y_dim)
+    x_all, y_all = x_b,          y_b              # (num_ctx,x_dim), (num_ctx,y_dim)
+    x_tgt, y_tgt = x_b[t_idx],   y_b[t_idx]       # (N_tgt,  x_dim), (N_tgt,  y_dim)
+    return x_ctx, y_ctx, x_all, y_all, n_ctx
 
 
 

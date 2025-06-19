@@ -1,10 +1,12 @@
 import math
 import random
+import pandas as pd
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from sklearn.metrics import (
     mean_squared_error,
     mean_absolute_percentage_error,
@@ -81,39 +83,27 @@ def load_and_preprocess(
 # Batch construction helper
 # -------------------------------------------------
 def make_np_batch(X, Y, num_ctx, min_ctx=3, max_ctx=None):
-    """Randomly sample an ANP training batch.
-
-    The routine chooses `num_ctx` data points, then designates
-    *n_ctx ∈ [min_ctx, max_ctx]* of them as context; the remainder are targets.
-
-    Args:
-        X: Full feature tensor, shape (N, x_dim).
-        Y: Full target tensor, shape (N, 1) or (N, y_dim).
-        num_ctx: Total points (context + target) in the batch.
-        min_ctx: Minimum number of context points.
-        max_ctx: Maximum number of context points. Defaults to `num_ctx-1`.
-
-    Returns:
-        Tuple[Tensor, Tensor, Tensor, Tensor, int, int]:
-            x_ctx, y_ctx, x_batch, y_batch, n_ctx, num_ctx.
-    """
     N = X.size(0)
     if num_ctx > N:
         raise ValueError("num_ctx bigger than dataset")
 
-    # Randomly pick indices for the batch
     idx = torch.randperm(N)[:num_ctx]
-    x_b, y_b = X[idx], Y[idx]
+    x_b, y_b = X[idx], Y[idx]  # batch = context + target
 
-    # Decide how many will be context points
     max_ctx = max_ctx or (num_ctx - 1)
     n_ctx = torch.randint(min_ctx, max_ctx + 1, (1,)).item()
-
-    # Randomly choose which indices are context
     c_idx = torch.randperm(num_ctx)[:n_ctx]
-    x_ctx, y_ctx = x_b[c_idx], y_b[c_idx]
 
-    return x_ctx, y_ctx, x_b, y_b, n_ctx, num_ctx
+    mask = torch.ones(num_ctx, dtype=torch.bool)
+    mask[c_idx] = False
+    t_idx = torch.where(mask)[0]
+
+    x_ctx, y_ctx = x_b[c_idx],   y_b[c_idx]       # (N_ctx,  x_dim), (N_ctx,  y_dim)
+    x_all, y_all = x_b,          y_b              # (num_ctx,x_dim), (num_ctx,y_dim)
+    x_tgt, y_tgt = x_b[t_idx],   y_b[t_idx]       # (N_tgt,  x_dim), (N_tgt,  y_dim)
+    return x_ctx, y_ctx, x_all, y_all, x_tgt, y_tgt, n_ctx
+
+
 
 
 # -------------------------------------------------
@@ -136,21 +126,21 @@ class MultiheadAttention(nn.Module):
     Classic scaled dot-product multi-head attention implemented from scratch.
     Returns shape (B, N_q, d_model).
     """
-    def __init__(self, d_model, n_head, dropout=0.1):
+    def __init__(self, d_model, n_head, dropout=0.0):
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
         self.n_head = n_head
         self.d_k = d_model // n_head
 
         # Projection layers for Q, K, V
-        self.wq = Linear(d_model, d_model, w_init="relu")
-        self.wk = Linear(d_model, d_model, w_init="relu")
-        self.wv = Linear(d_model, d_model, w_init="relu")
+        self.wq = Linear(d_model, d_model, w_init="linear")
+        self.wk = Linear(d_model, d_model, w_init="linear")
+        self.wv = Linear(d_model, d_model, w_init="linear")
         self.out_proj = Linear(d_model, d_model)
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, key, value, query):
+    def forward(self, query, key, value):
         """
         key, value : (B, N_k, d_model)
         query       : (B, N_q, d_model)
@@ -169,7 +159,7 @@ class MultiheadAttention(nn.Module):
         V = proj(value, self.wv)
 
         # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)  # (B, h, N_q, N_k)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * (self.d_k ** -0.5)
         attn   = F.softmax(scores, dim=-1)
         attn   = self.dropout(attn)
 
@@ -182,14 +172,14 @@ class MultiheadAttention(nn.Module):
 
 class Attention(nn.Module):
     """Attention block with residual connection, norm, and dropout."""
-    def __init__(self, d_model, n_head, dropout=0.1):
+    def __init__(self, d_model, n_head, dropout=0.0):
         super().__init__()
         self.mha  = MultiheadAttention(d_model, n_head, dropout)
         self.norm = nn.LayerNorm(d_model)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, key, value, query):
-        out = self.mha(key, value, query)
+    def forward(self, query, key, value):
+        out = self.mha(query, key, value)
         out = self.drop(out)
         return self.norm(out + query)  # residual + layer norm
 
@@ -205,7 +195,7 @@ class LatentEncoder(nn.Module):
         self_attn1/self_attn2: Two self-attention blocks over context points.
         stat_mlp: Aggregates to global statistics (μ, log σ).
     """
-    def __init__(self, x_dim, y_dim, d_model, z_dim, n_head=8, dropout=0.1):
+    def __init__(self, x_dim, y_dim, d_model, z_dim, n_head=8):
         super().__init__()
         # 1) Embed each (x, y) pair
         self.input_mlp = nn.Sequential(
@@ -214,11 +204,13 @@ class LatentEncoder(nn.Module):
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
         )
 
         # 2) Two layers of self-attention
-        self.self_attn1 = Attention(d_model, n_head, dropout)
-        self.self_attn2 = Attention(d_model, n_head, dropout)
+        self.self_attn1 = Attention(d_model, n_head)
+        self.self_attn2 = Attention(d_model, n_head)
 
         # 3) Aggregate across points and map to (μ, log σ)
         self.stat_mlp = nn.Sequential(
@@ -249,10 +241,7 @@ class LatentEncoder(nn.Module):
         stats = self.stat_mlp(s_C)                     # (B, 2*z_dim)
         mu, log_sigma = stats.chunk(2, dim=-1)
 
-        # Stabilised σ (choose variant 1 / 2 / 3)
         sigma = 0.1 + 0.9 * torch.sigmoid(log_sigma)   # 1
-        # sigma = 0.1 + 0.9 * F.softplus(log_sigma)    # 2
-        # sigma = F.softplus(log_sigma) + 1e-6         # 3
 
         # Re-parameterisation trick
         eps = torch.randn_like(sigma)
@@ -268,11 +257,13 @@ class DeterministicEncoder(nn.Module):
     Produces a deterministic representation r for each target x_tgt
     via cross-attention from context.
     """
-    def __init__(self, x_dim, y_dim, d_model, n_head, dropout=0.1):
+    def __init__(self, x_dim, y_dim, d_model, n_head, dropout=0.0):
         super().__init__()
         # Embed each (x_ctx, y_ctx)
         self.input_mlp = nn.Sequential(
             nn.Linear(x_dim + y_dim, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -308,11 +299,11 @@ class DeterministicEncoder(nn.Module):
 
         # K & Q come from context and target respectively
         k = self.key_mlp(x_ctx)
-        q = self.query_mlp(x_tgt)
+        q = self.key_mlp(x_tgt)
 
         # Two-layer cross-attention
-        r = self.cross_attn1(k, v, q)
-        r = self.cross_attn2(k, v, r)
+        r = self.cross_attn1(q, k, v)
+        r = self.cross_attn2(r, k, v)
         return r
 
 
@@ -348,13 +339,12 @@ class Decoder(nn.Module):
         inp = torch.cat([x_tgt, r, z], dim=-1)
         stats = self.net(inp)                         # (B, N, 2*y_dim)
         mu_y, log_sigma_y = stats.chunk(2, dim=-1)
-
-        # Stabilised σ_y (choose variant 1 / 2 / 3)
-        # sigma_y = 0.1 + 0.9 * torch.sigmoid(log_sigma_y)               # 1
-        # sigma_y = 0.1 + 0.9 * torch.tanh(F.softplus(log_sigma_y))      # 2
-        sigma_y = 0.1 + 0.9 * F.softplus(log_sigma_y)                    # 3
-
+        sigma_y = 0.1 + 0.9 * F.softplus(log_sigma_y)
         return mu_y, sigma_y
+
+
+from torch.distributions import Normal
+from torch.distributions.kl import kl_divergence
 
 
 # -------------------------------------------------
@@ -368,25 +358,24 @@ class AttentiveNeuralProcess(nn.Module):
         d_model=128,
         z_dim=128,
         n_head=8,
-        dropout=0.1,
+        dropout=0.0,
     ):
         super().__init__()
-        self.latent_encoder = LatentEncoder(x_dim, y_dim, d_model, z_dim, n_head, dropout)
+        self.latent_encoder = LatentEncoder(x_dim, y_dim, d_model, z_dim, n_head)
         self.det_encoder    = DeterministicEncoder(x_dim, y_dim, d_model, n_head, dropout)
         self.decoder        = Decoder(x_dim, d_model, y_dim)
 
-    def forward(self, x_ctx, y_ctx, x_tgt, y_tgt=None):
+    def forward(self, x_ctx, y_ctx, x_all, y_all, x_tgt, y_tgt=None):
         """
         Training mode returns (μ_y, σ_y, KL, total_loss, NLL).
         Evaluation mode returns (μ_y, σ_y).
         """
+
         # Prior from context only
         z_p, mu_p, sig_p = self.latent_encoder(x_ctx, y_ctx)
 
         # During training, sample posterior using targets as well
         if self.training:
-            x_all = torch.cat([x_ctx, x_tgt], dim=1)
-            y_all = torch.cat([y_ctx, y_tgt], dim=1)
             z_q, mu_q, sig_q = self.latent_encoder(x_all, y_all)
             z = z_q
         else:  # evaluation: use prior
@@ -402,7 +391,7 @@ class AttentiveNeuralProcess(nn.Module):
         if y_tgt is not None:
             nll = gaussian_nll(mu_y, sig_y, y_tgt).mean()
             kl  = kl_div(mu_q, sig_q, mu_p, sig_p).mean()
-            loss = nll + kl / y_tgt.size(1)  # divide by N_tgt as in ANP paper
+            loss = nll + kl / y_tgt.size(1)
             return mu_y, sig_y, kl, loss, nll
         else:
             return mu_y, sig_y
@@ -429,7 +418,7 @@ def kl_div(mu_q, sig_q, mu_p, sig_p):
 # -------------------------------------------------
 # Single optimisation step
 # -------------------------------------------------
-def train_step(model, opt, X, Y, num_ctx, min_ctx, device):
+def train_step(model, opt, X, Y, num_ctx, min_ctx, device, kl_weight):
     """Run one optimisation step for ANP.
 
     Args:
@@ -444,13 +433,17 @@ def train_step(model, opt, X, Y, num_ctx, min_ctx, device):
     Returns:
         Tuple[float, float, float]: loss, negative-log-likelihood, KL divergence.
     """
-    x_c, y_c, x_t, y_t, _, _ = make_np_batch(X, Y, num_ctx, min_ctx)
-    x_c = x_c.unsqueeze(0).to(device)  # add batch dim
+    x_c, y_c, x_all, y_all, x_t, y_t, n_ctx = make_np_batch(X, Y, num_ctx, min_ctx)
+    x_c = x_c.unsqueeze(0).to(device)
     y_c = y_c.unsqueeze(0).to(device)
+    x_all = x_all.unsqueeze(0).to(device)
+    y_all = y_all.unsqueeze(0).to(device)
     x_t = x_t.unsqueeze(0).to(device)
     y_t = y_t.unsqueeze(0).to(device)
 
-    mu_y, sig_y, kl, loss, nll = model(x_c, y_c, x_t, y_t)
+    mu_y, sig_y, kl, loss, nll = model(x_c, y_c, x_all, y_all, x_t, y_t)
+
+    loss = nll + kl_weight * kl
 
     opt.zero_grad()
     loss.backward()
@@ -495,29 +488,75 @@ def main(config):
         optimizer, T_max=config["T_max"], eta_min=config["lr_min"]
     )
 
+    kl_warmup_epochs = 2000
+
+    # ---- Training loop ----
+    losses = []  # 记录每个 epoch 的总 loss
+    nlls = []  # 如果你也想画 nll
+    kls = []  # 或者 KL
+
     # ---- Training loop ----
     for epoch in range(1, config["epochs"] + 1):
         model.train()
+
+        kl_weight = min(1.0, epoch / kl_warmup_epochs)
+
         loss, nll, kl = train_step(
             model, optimizer, X_tr, y_tr,
             num_ctx=config["num_ctx"],
             min_ctx=config["min_ctx"],
-            device=device
+            device=device,
+            kl_weight=kl_weight
         )
         scheduler.step()
+
+        losses.append(loss)
+        nlls.append(nll)
+        kls.append(kl)
+
         if epoch % config["log_freq"] == 0:
-            print(f"Epoch {epoch:4d} → loss={loss:.4f}, nll={nll:.4f}, kl={kl:.4f}")
+            print(f"Epoch {epoch:4d} → loss={loss:.4f}, nll={nll:.4f}, "
+                  f"kl={kl:.4f}, weight={kl_weight:.2f}")
+
+
+    # epochs = range(1, config["epochs"] + 1)
+    #
+    # # 1. 计算滑动平均
+    # window_size = 50  # 你可以改成 20、100 看看效果
+    # loss_series = pd.Series(losses)
+    # loss_smooth = loss_series.rolling(window=window_size, min_periods=1).mean()
+    #
+    # # 2. 画图
+    # plt.figure(figsize=(6, 4))
+    # plt.plot(epochs, losses, alpha=0.3, label="Raw Loss")
+    # plt.plot(epochs, loss_smooth, linewidth=2, label=f"Smooth Loss (w={window_size})")
+    # plt.xlabel("Epoch")
+    # plt.ylabel("Loss")
+    # plt.title(f"Seed {config['seed']} Loss Curve")
+    # plt.grid(True)
+    # plt.legend()
+    # plt.show()
 
     # ---- Evaluation ----
     model.eval()
     with torch.no_grad():
+        # 1) context = 训练集
         x_c = X_tr.unsqueeze(0).to(device)
         y_c = y_tr.unsqueeze(0).to(device)
+        # 2) targets = 测试集
         x_t = X_te.unsqueeze(0).to(device)
-        mu_y, _ = model(x_c, y_c, x_t)
+        y_t = y_te.unsqueeze(0).to(device)
+        # 3) 后验集合 = context ∪ target
+        x_all = torch.cat([x_c, x_t], dim=1)
+        y_all = torch.cat([y_c, y_t], dim=1)
+
+        # 4) 正确调用 forward（y_tgt 用默认的 None）
+        mu_y, _ = model(x_c, y_c, x_all, y_all, x_t)
+
+        # 5) 反标准化、计算指标
         mu_y = mu_y.squeeze(0).cpu().numpy()
         y_pred = y_scaler.inverse_transform(mu_y)
-        y_true = y_scaler.inverse_transform(y_te.cpu().numpy())
+        y_true = y_scaler.inverse_transform(y_t.squeeze(0).cpu().numpy())
 
     # ---- Metrics ----
     mse  = mean_squared_error(y_true, y_pred)
@@ -541,11 +580,9 @@ def main(config):
 # Entry point for multiple random seeds
 # -------------------------------------------------
 if __name__ == "__main__":
-    import pandas as pd
-
     base_config = {
         "train_size": 40,
-        "dataset_path": "./NitrideMetal (Dataset 2) NTi.csv",
+        "dataset_path": "./Nitride (Dataset 1) NTi.csv",
         "target_col": "Thickness",
         "lr": 1e-3,
         "lr_min": 1e-4,
@@ -556,12 +593,12 @@ if __name__ == "__main__":
         "d_model": 128,
         "z_dim": 128,
         "n_head": 8,
-        "dropout": 0.1,
+        "dropout": 0.0,
         "log_freq": 50
     }
 
     all_stats = []
-    for seed in range(10):
+    for seed in range(47,48):
         config = base_config.copy()
         config["seed"] = seed
         print(f"\n=== Running seed {seed} ===")
