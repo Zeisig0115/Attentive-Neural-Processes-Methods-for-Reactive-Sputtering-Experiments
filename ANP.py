@@ -79,31 +79,21 @@ def load_and_preprocess(
     )
 
 
-# -------------------------------------------------
-# Batch construction helper
-# -------------------------------------------------
-def make_np_batch(X, Y, num_ctx, min_ctx=3, max_ctx=None):
+def make_np_batch(X, Y, num_ctx, min_ctx=3):
     N = X.size(0)
     if num_ctx > N:
         raise ValueError("num_ctx bigger than dataset")
-
-    idx = torch.randperm(N)[:num_ctx]
-    x_b, y_b = X[idx], Y[idx]  # batch = context + target
-
-    max_ctx = max_ctx or (num_ctx - 1)
-    n_ctx = torch.randint(min_ctx, max_ctx + 1, (1,)).item()
-    c_idx = torch.randperm(num_ctx)[:n_ctx]
-
-    mask = torch.ones(num_ctx, dtype=torch.bool)
+    if min_ctx > num_ctx:
+        raise ValueError("min_ctx bigger than num_ctx")
+    x_all, y_all = X, Y
+    n_ctx = torch.randint(min_ctx, num_ctx + 1, (1,)).item()
+    c_idx = torch.randperm(N)[:n_ctx]
+    mask = torch.ones(N, dtype=torch.bool)
     mask[c_idx] = False
     t_idx = torch.where(mask)[0]
-
-    x_ctx, y_ctx = x_b[c_idx],   y_b[c_idx]       # (N_ctx,  x_dim), (N_ctx,  y_dim)
-    x_all, y_all = x_b,          y_b              # (num_ctx,x_dim), (num_ctx,y_dim)
-    x_tgt, y_tgt = x_b[t_idx],   y_b[t_idx]       # (N_tgt,  x_dim), (N_tgt,  y_dim)
+    x_ctx, y_ctx = x_all[c_idx], y_all[c_idx]
+    x_tgt, y_tgt = x_all[t_idx], y_all[t_idx]
     return x_ctx, y_ctx, x_all, y_all, x_tgt, y_tgt, n_ctx
-
-
 
 
 # -------------------------------------------------
@@ -488,7 +478,7 @@ def main(config):
         optimizer, T_max=config["T_max"], eta_min=config["lr_min"]
     )
 
-    kl_warmup_epochs = 2000
+    kl_warmup_epochs = 200
 
     # ---- Training loop ----
     losses = []  # 记录每个 epoch 的总 loss
@@ -519,23 +509,23 @@ def main(config):
                   f"kl={kl:.4f}, weight={kl_weight:.2f}")
 
 
-    # epochs = range(1, config["epochs"] + 1)
-    #
-    # # 1. 计算滑动平均
-    # window_size = 50  # 你可以改成 20、100 看看效果
-    # loss_series = pd.Series(losses)
-    # loss_smooth = loss_series.rolling(window=window_size, min_periods=1).mean()
-    #
-    # # 2. 画图
-    # plt.figure(figsize=(6, 4))
+    epochs = range(1, config["epochs"] + 1)
+
+    # 1. 计算滑动平均
+    window_size = 50  # 你可以改成 20、100 看看效果
+    loss_series = pd.Series(losses)
+    loss_smooth = loss_series.rolling(window=window_size, min_periods=1).mean()
+
+    # 2. 画图
+    plt.figure(figsize=(6, 4))
     # plt.plot(epochs, losses, alpha=0.3, label="Raw Loss")
-    # plt.plot(epochs, loss_smooth, linewidth=2, label=f"Smooth Loss (w={window_size})")
-    # plt.xlabel("Epoch")
-    # plt.ylabel("Loss")
-    # plt.title(f"Seed {config['seed']} Loss Curve")
-    # plt.grid(True)
-    # plt.legend()
-    # plt.show()
+    plt.plot(epochs, loss_smooth, linewidth=2, label=f"Smooth Loss (w={window_size})")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Seed {config['seed']} Loss Curve")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
 
     # ---- Evaluation ----
     model.eval()
@@ -583,11 +573,11 @@ if __name__ == "__main__":
     base_config = {
         "train_size": 40,
         "dataset_path": "./Nitride (Dataset 1) NTi.csv",
-        "target_col": "Thickness",
+        "target_col": "N/Ti",
         "lr": 1e-3,
         "lr_min": 1e-4,
         "T_max": 500,
-        "epochs": 2000,
+        "epochs": 500,
         "num_ctx": 32,
         "min_ctx": 3,
         "d_model": 128,
