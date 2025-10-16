@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Load dataset (update the path if needed)
-df = pd.read_csv("./Nitride (Dataset 1) NTi.csv")
+df = pd.read_csv("./data/Nitride (Dataset 1) NTi.csv")
 
 # Split with fixed seed
 seed = 34
